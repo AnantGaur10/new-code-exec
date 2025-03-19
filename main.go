@@ -328,7 +328,7 @@ func languageConfig(lang string) (container.Config, bool) {
 		"python": {
 			Image:        "python:3.9-slim",
 			Cmd:          []string{"python", "-c"},
-			Tty:          true,
+			Tty:          false,
 			AttachStdin:  true,
 			AttachStdout: true,
 			AttachStderr: true,
@@ -338,7 +338,7 @@ func languageConfig(lang string) (container.Config, bool) {
 		"javascript": {
 			Image:        "node:18-slim",
 			Cmd:          []string{"node", "-e"},
-			Tty:          true,
+			Tty:          false,
 			AttachStdin:  true,
 			AttachStdout: true,
 			AttachStderr: true,
@@ -349,7 +349,7 @@ func languageConfig(lang string) (container.Config, bool) {
 			Image:        "golang:1.23.7-alpine",
 			Cmd:          []string{"sh", "-c", "mkdir -p /app && echo \"$CODE\" > /app/main.go && cd /app && go run main.go"},
 			Env:          []string{"CODE=${CODE}"},
-			Tty:          true,
+			Tty:          false,
 			AttachStdin:  true,
 			AttachStdout: true,
 			AttachStderr: true,
@@ -456,6 +456,10 @@ func startInteractiveContainer(ctx context.Context, code string, config containe
 		cancelContainer()
 		return "", "", fmt.Errorf("container create failed: %w", err), time.Since(startTime)
 	}
+	if len(resp.Warnings) > 0 {
+		fmt.Println("warnings on creating container", resp.Warnings)
+	}
+
 	log.Printf("Container creation completed %v \n", resp)
 
 	// Attach to container for I/O
@@ -541,7 +545,7 @@ func startInteractiveContainer(ctx context.Context, code string, config containe
 
 		case <-outputTimeout:
 			// Timed out waiting for output
-			fmt.Println("Timed out waiting for container output")
+			log.Println("Timed out waiting for container output")
 
 			// Get whatever might be in the buffer
 			session.mu.Lock()
@@ -582,18 +586,53 @@ func startInteractiveContainer(ctx context.Context, code string, config containe
 	return output, waitingState, nil, duration
 }
 
+type LoggingReader struct {
+	reader io.Reader
+	prefix string
+}
+
+// Read implements the io.Reader interface
+func (lr *LoggingReader) Read(p []byte) (n int, err error) {
+	n, err = lr.reader.Read(p)
+	if n > 0 {
+		log.Printf("%s: Read %d bytes: %s", lr.prefix, n, string(p[:n]))
+		// For binary data, you might want to use hexdump instead:
+		// log.Printf("%s: Read %d bytes: %x", lr.prefix, n, p[:n])
+	}
+	if err != nil {
+		log.Printf("%s: Read error: %v", lr.prefix, err)
+	}
+	return n, err
+}
+
 // handleContainerIO manages all I/O for a container session
 func handleContainerIO(session *containerSession, sessionID string) {
 	// Create readers for stdout and stderr
 	stdoutReader, stdoutWriter := io.Pipe()
 	stderrReader, stderrWriter := io.Pipe()
-
+	// defer func() {
+	//     fmt.Println("Flushing and closing stdout/stderr writers")
+	//     stdoutWriter.Close()
+	//     stderrWriter.Close()
+	// }()
 	// Start demuxing in a goroutine
 	go func() {
 		defer stdoutWriter.Close()
 		defer stderrWriter.Close()
-		stdcopy.StdCopy(stdoutWriter, stderrWriter, session.hijackedResp.Reader)
-		fmt.Println("Completed demultiplexing")
+
+		// Wrap the reader with our logging reader
+		loggingReader := &LoggingReader{
+			reader: session.hijackedResp.Reader,
+			prefix: fmt.Sprintf("Session[%s]", sessionID),
+		}
+
+		// Use the wrapped reader instead
+		n, err := stdcopy.StdCopy(stdoutWriter, stderrWriter, loggingReader)
+		if err != nil && !strings.Contains(err.Error(), "closed") {
+			log.Printf("Demux error: %v", err)
+		}
+
+		log.Println("Completed demultiplexing read", n, "bytes")
 	}()
 
 	// Output processing goroutines
@@ -737,7 +776,7 @@ func processStreamToBuffer(reader io.Reader, buffer *strings.Builder, isError bo
 				}
 				return
 			}
-
+			fmt.Println("no of bytes is ", n)
 			if n > 0 {
 				data := string(buf[:n])
 				fmt.Printf("Read %d bytes from %s: %s\n", n, streamType, data)
@@ -748,15 +787,13 @@ func processStreamToBuffer(reader io.Reader, buffer *strings.Builder, isError bo
 				session.mu.Unlock()
 
 				// Instead of waiting for the ticker, send data immediately
-				containerOutput := ContainerOutput{
-					Stdout: "",
-					Stderr: "",
-				}
-
+				containerOutput := ContainerOutput{}
 				if isError {
 					containerOutput.Stderr = data
+					containerOutput.Stdout = ""
 				} else {
 					containerOutput.Stdout = data
+					containerOutput.Stderr = ""
 				}
 
 				// Try to send to channel without blocking
